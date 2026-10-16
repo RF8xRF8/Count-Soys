@@ -1,0 +1,648 @@
+拍照计数系统（Photo Count）项目开发说明书
+
+本文档面向接手开发的 AI 或工程师。请严格按本文档实现，遇到文档未覆盖的细节，优先选择简单、可运行、易维护的方案，并在 README 中记录决策。
+
+一、项目背景与目标
+
+1. 背景
+实验室场景下需要频繁对药片、豆子、细胞等离散物体进行计数。传统人工计数效率低、易出错。本系统提供「手机或电脑拍照 → 上传 → 服务端自动计数 → 返回打点编号图 + 计数结果」的闭环。
+
+2. 目标
+- 用户通过浏览器拍照或上传图片，服务端在 1～2 秒内返回标注图与计数。
+- 系统不开放注册，所有账号由管理员在后台创建。
+- 支持多账号登录、JWT 鉴权，区分普通用户与管理员。
+- 记录每次计数任务，提供个人与全局使用统计。
+- 第一版算法使用分水岭（Watershed），后续可平滑替换为 YOLO 或 Cellpose，不影响上层架构。
+
+3. 非目标（本期不做）
+- 视频流计数
+- 微信小程序
+- 移动端原生 App
+- 实时 WebSocket 推送
+- GPU 推理
+- 用户自助注册
+- 用户自助找回密码（密码重置由管理员完成）
+
+二、技术栈
+
+前端：
+- 框架：Vue 3，Composition API + script setup
+- 构建：Vite
+- 路由：Vue Router 4
+- 状态：Pinia
+- UI 库：Element Plus
+- HTTP：Axios，统一封装拦截器
+- 图表：ECharts
+- 图片上传：原生 input type=file accept=image/* capture=environment，配合 Canvas 压缩
+- 包管理：pnpm
+
+后端：
+- 语言：Python 3.10+
+- 框架：FastAPI
+- ASGI：Uvicorn
+- ORM：SQLAlchemy 2.x
+- 迁移：Alembic
+- 数据库：开发用 SQLite，生产用 PostgreSQL
+- 缓存队列：Redis（可选，第二期）
+- 鉴权：JWT，access + refresh
+- 密码哈希：bcrypt，passlib
+- 图像处理：opencv-python-headless + numpy
+- 图像 IO：Pillow，处理 EXIF
+- 校验：Pydantic v2
+
+部署：
+- Docker + docker-compose
+- Nginx 反代前端静态资源与后端 API
+- 对象存储可选，本地磁盘起步即可
+
+三、系统架构
+
+浏览器（Vue 3 SPA）：
+登录、上传、结果展示、历史、统计、管理
+
+Nginx：
+反代 + 静态资源
+
+FastAPI 服务：
+- 鉴权模块
+- 计数模块
+- 统计模块
+- 用户模块
+- 任务模块
+- 管理模块
+
+存储层：
+- PostgreSQL，存用户、任务、统计
+- 本地磁盘或 OSS，存原图与结果图
+
+四、目录结构
+
+后端：
+
+backend/
+  app/
+    main.py                  FastAPI 入口
+    config.py                配置，读取 .env
+    database.py              SQLAlchemy engine 和 session
+    deps.py                  依赖注入，当前用户等
+    models/
+      user.py
+      task.py
+      stats.py
+    schemas/
+      auth.py
+      user.py
+      task.py
+      stats.py
+    api/
+      auth.py
+      users.py
+      count.py
+      tasks.py
+      stats.py
+      admin.py
+    core/
+      security.py            JWT、密码哈希
+      exceptions.py
+    services/
+      counting.py            分水岭核心算法
+      image_io.py            EXIF、缩放、编解码
+      storage.py             文件存储抽象
+    utils/
+  alembic/
+  scripts/
+    seed.py                  初始化管理员账号
+  tests/
+  requirements.txt
+  Dockerfile
+  .env.example
+
+前端：
+
+frontend/
+  src/
+    main.js
+    App.vue
+    router/index.js
+    stores/
+      auth.js
+      task.js
+    api/
+      request.js             axios 实例与拦截器
+      auth.js
+      count.js
+      tasks.js
+      stats.js
+      admin.js
+    views/
+      Login.vue
+      Dashboard.vue
+      Count.vue
+      History.vue
+      Stats.vue
+      Profile.vue
+      admin/
+        Users.vue
+        Overview.vue
+    components/
+      ImageUploader.vue
+      ResultViewer.vue
+      ParamPanel.vue
+      CountHistoryTable.vue
+    layouts/
+      MainLayout.vue
+    utils/
+      image.js               Canvas 压缩
+      format.js
+  index.html
+  vite.config.js
+  package.json
+  Dockerfile
+
+注意：前端不包含注册页，登录页需提示「账号由管理员创建」。
+
+五、数据库设计
+
+1. users 表
+- id，BIGINT 主键，自增
+- username，VARCHAR(64)，唯一，登录名
+- email，VARCHAR(128)，唯一
+- password_hash，VARCHAR(255)，bcrypt
+- role，VARCHAR(16)，user 或 admin，默认 user
+- status，SMALLINT，1 正常，0 禁用
+- daily_quota，INT，每日计数次数上限，默认 100
+- created_by，BIGINT，创建该用户的管理员 id，系统初始化管理员可为空
+- created_at，TIMESTAMP
+- updated_at，TIMESTAMP
+- last_login_at，TIMESTAMP
+
+2. tasks 表
+- id，BIGINT 主键
+- task_id，VARCHAR(32)，唯一，UUID hex
+- user_id，BIGINT，外键 users.id
+- mode，VARCHAR(16)，pills 或 beans 或 cells
+- params_json，TEXT，用户传入参数快照
+- original_path，VARCHAR(255)，原图相对路径
+- annotated_path，VARCHAR(255)，结果图相对路径
+- count，INT，计数结果
+- instances_json，TEXT，每个实例的坐标与面积
+- width，INT，处理时图像宽
+- height，INT，处理时图像高
+- elapsed_ms，INT，服务端耗时
+- status，VARCHAR(16)，success 或 failed
+- error_msg，VARCHAR(255)，失败原因
+- client_ip，VARCHAR(45)
+- created_at，TIMESTAMP
+
+索引：user_id、created_at、mode、status。
+
+3. daily_stats 表（可选，或直接聚合 tasks）
+- id，BIGINT 主键
+- stat_date，DATE
+- user_id，BIGINT，外键
+- mode，VARCHAR(16)
+- total_count，INT，任务数
+- success_count，INT，成功数
+- failed_count，INT，失败数
+- sum_elapsed_ms，BIGINT，总耗时
+- sum_objects，BIGINT，累计识别物体数
+
+唯一索引：(stat_date, user_id, mode)。
+第一版建议直接聚合 tasks 表，简单可靠。
+
+4. refresh_tokens 表（可选）
+- id，BIGINT 主键
+- user_id，BIGINT，外键
+- token，VARCHAR(255)，唯一
+- expires_at，TIMESTAMP
+- revoked，BOOLEAN
+- created_at，TIMESTAMP
+
+六、后端 API 设计
+
+统一前缀：/api
+统一响应格式：
+{ "code": 0, "message": "ok", "data": { } }
+code=0 成功，非 0 失败。HTTP 状态码仍按语义返回 401、403、404、500 等。
+分页参数：page、page_size，返回 items、total、page、page_size。
+
+1. 鉴权接口
+
+POST   /api/auth/login             登录，返回 access + refresh       公开
+POST   /api/auth/refresh           刷新 access token                公开
+POST   /api/auth/logout            登出，撤销 refresh token         登录
+GET    /api/auth/me                当前用户信息                     登录
+POST   /api/auth/change-password   修改自己的密码                   登录
+
+不提供 /api/auth/register。所有账号由管理员通过 /api/admin/users 创建。
+
+登录请求：
+{ "username": "alice", "password": "xxx" }
+
+登录响应：
+{
+  "code": 0,
+  "data": {
+    "access_token": "...",
+    "refresh_token": "...",
+    "token_type": "bearer",
+    "expires_in": 7200,
+    "user": {
+      "id": 1,
+      "username": "alice",
+      "email": "a@b.com",
+      "role": "user",
+      "daily_quota": 100
+    }
+  }
+}
+
+JWT Payload：
+{
+  "sub": "1",
+  "username": "alice",
+  "role": "user",
+  "type": "access",
+  "exp": 1700000000
+}
+
+access 有效期 2 小时，refresh 有效期 14 天，密钥从 JWT_SECRET 环境变量读取。
+
+2. 计数接口
+
+POST   /api/count                     上传图片并计数               登录
+GET    /api/count/{task_id}           查询结果                     登录，仅本人或 admin
+POST   /api/count/{task_id}/edit      人工修正计数点               登录，仅本人或 admin
+GET    /api/count/{task_id}/csv       导出实例 CSV                 登录，仅本人或 admin
+
+POST /api/count：
+Content-Type 为 multipart/form-data。
+字段：
+- file，图片文件，必填
+- mode，pills 或 beans 或 cells，默认 pills
+- params，JSON 字符串，可选
+
+params 支持字段：
+{
+  "min_area": 100,
+  "fg_ratio": 0.5,
+  "threshold_mode": "otsu_inv",
+  "max_side": 1600,
+  "draw_number": true
+}
+
+响应：
+{
+  "code": 0,
+  "data": {
+    "task_id": "a1b2c3d4...",
+    "count": 87,
+    "annotated_url": "/files/results/a1b2c3d4_annotated.jpg",
+    "original_url": "/files/uploads/a1b2c3d4_original.jpg",
+    "instances": [
+      { "id": 1, "x": 123, "y": 456, "area": 812 }
+    ],
+    "elapsed_ms": 350,
+    "width": 1600,
+    "height": 1200,
+    "warnings": []
+  }
+}
+
+POST /api/count/{task_id}/edit 请求体：
+{
+  "instances": [
+    { "id": 1, "x": 123, "y": 456, "area": 0 },
+    { "id": 2, "x": 200, "y": 300, "area": 0 }
+  ]
+}
+服务端重新生成标注图并更新 count。
+
+GET /api/count/{task_id}/csv 返回 text/csv，列：id、x、y、area。
+
+3. 任务历史接口
+
+GET    /api/tasks             当前用户任务列表，支持 mode、start、end、page、page_size
+DELETE /api/tasks/{task_id}   删除任务，同时删除文件
+
+4. 统计接口
+
+GET /api/stats/me/summary            个人总览：总任务数、成功数、失败数、累计识别物体数、平均耗时
+GET /api/stats/me/daily?days=30      个人按天统计，折线图用
+GET /api/stats/me/by-mode            个人按模式统计，饼图用
+
+summary 响应示例：
+{
+  "code": 0,
+  "data": {
+    "total_tasks": 120,
+    "success_tasks": 118,
+    "failed_tasks": 2,
+    "total_objects": 10324,
+    "avg_elapsed_ms": 420,
+    "today_tasks": 8,
+    "today_quota": 100
+  }
+}
+
+daily 响应示例：
+{
+  "code": 0,
+  "data": [
+    { "date": "2025-01-01", "tasks": 12, "objects": 980, "avg_elapsed_ms": 410 }
+  ]
+}
+
+5. 管理接口，仅 admin
+
+GET    /api/admin/users                          用户列表，支持搜索、分页
+POST   /api/admin/users                          新建用户
+PATCH  /api/admin/users/{id}                     修改角色、状态、配额
+DELETE /api/admin/users/{id}                     删除用户
+POST   /api/admin/users/{id}/reset-password      重置密码
+GET    /api/admin/overview                       全局统计
+GET    /api/admin/tasks                          全部任务列表
+
+POST /api/admin/users 请求体：
+{
+  "username": "alice",
+  "email": "a@b.com",
+  "password": "初始密码",
+  "role": "user",
+  "daily_quota": 100
+}
+
+PATCH /api/admin/users/{id} 请求体，字段均可选：
+{
+  "role": "admin",
+  "status": 1,
+  "daily_quota": 200
+}
+
+POST /api/admin/users/{id}/reset-password 请求体：
+{ "new_password": "xxxxxx" }
+
+七、核心算法实现（分水岭）
+
+放在 app/services/counting.py，接口签名：
+def count_objects(img_bgr, mode, params) -> (annotated, instances, warnings)
+instances 格式：[{"id": 1, "x": 123, "y": 456, "area": 812}, ...]
+
+参考实现要点：
+- 灰度化，GaussianBlur 5x5
+- threshold_mode 为 otsu_inv 时用 THRESH_BINARY_INV + OTSU，否则 THRESH_BINARY + OTSU
+- 形态学开运算，kernel 3x3，iterations=2
+- 膨胀得到 sure_bg
+- distanceTransform 得到距离图
+- 阈值取 fg_ratio * dist.max() 得到 sure_fg
+- unknown = sure_bg - sure_fg
+- connectedComponents 得到 markers，markers 加 1，unknown 处置 0
+- cv2.watershed 分割
+- 遍历 label，面积小于 min_area 的丢弃
+- 每个 label 取质心 (cx, cy)，依次编号，写入 instances
+- 画点、编号、顶部写 Count=N
+
+图像预处理放在 app/services/image_io.py：
+- 用 Pillow 打开，先 ImageOps.exif_transpose 处理手机竖拍方向
+- 转 RGB，再转 BGR ndarray
+- 长边缩放到 max_side，默认 1600，用 INTER_AREA
+
+八、鉴权与权限
+
+流程：
+1. 管理员创建用户，用户拿到初始密码。
+2. 用户登录，校验密码，签发 access + refresh。
+3. 前端存 token，access 与 refresh 都放 localStorage。
+4. 请求拦截器自动加 Authorization: Bearer access。
+5. 响应 401 时自动用 refresh 换新 access，refresh 失效则跳登录页。
+6. 登出调用 /api/auth/logout，前端清空 token。
+
+权限控制：
+- get_current_user 依赖，解析 JWT，查库校验 status=1。
+- require_admin 依赖，在 get_current_user 基础上校验 role=admin。
+- 资源级权限：任务详情、编辑、删除时校验 task.user_id == current_user.id 或 role == admin。
+
+配额控制：
+- 每次 POST /api/count 前，统计该用户当天成功任务数。
+- 若大于等于 daily_quota，返回 429 与提示。
+- admin 不受配额限制。
+
+九、前端设计
+
+路由表：
+/login            Login.vue          公开      登录
+/                 Dashboard.vue      登录      首页概览
+/count            Count.vue          登录      拍照计数主页面
+/history          History.vue        登录      历史任务
+/stats            Stats.vue          登录      个人统计
+/profile          Profile.vue        登录      个人资料、改密
+/admin/users      admin/Users.vue    admin     用户管理
+/admin/overview   admin/Overview.vue admin     全局统计
+
+路由守卫：未登录跳 /login；非 admin 访问 /admin/* 跳 /。
+
+Count.vue 要点：
+- 上传区用 input type=file accept=image/* capture=environment，移动端直接调后置摄像头。
+- 上传前用 Canvas 压缩到长边 1600，质量 0.8。
+- 模式选择：药片、豆子、细胞。
+- 参数面板可折叠：min_area、fg_ratio、threshold_mode、draw_number。
+- 上传后显示 loading，返回后左右或上下对比原图与标注图。
+- 显示计数结果与耗时。
+- 提供重新计数、导出 CSV 按钮。
+- 人工修正第二期可选，在标注图上叠加可点击 marker，支持添加点、删除点，提交到 /api/count/{task_id}/edit。
+
+History.vue 要点：
+- 表格列：时间、模式、计数、耗时、状态、操作（查看、下载、删除）。
+- 筛选：模式、时间范围。
+- 分页。
+
+Stats.vue 要点：
+- 顶部卡片：总任务、成功数、失败数、累计物体数、平均耗时、今日已用配额。
+- 折线图：近 30 天任务数与物体数。
+- 饼图：按模式分布。
+
+admin/Users.vue 要点：
+- 用户表格：用户名、邮箱、角色、状态、配额、注册时间、最后登录。
+- 操作：新建用户、编辑角色与状态与配额、重置密码、删除。
+- 新建用户弹窗字段：username、email、password、role、daily_quota。
+
+admin/Overview.vue 要点：
+- 全局卡片：用户数、任务总数、今日任务、成功率。
+- 图表：按模式分布、近 30 天趋势、Top 用户排行。
+
+Axios 封装要点：
+- baseURL 为 /api，timeout 30 秒。
+- 请求拦截器读取 auth store 中的 accessToken，加到 Authorization 头。
+- 响应拦截器判断 body.code，非 0 直接 reject。
+- 401 时用 refreshToken 换新 access，仅重试一次，失败则清空并跳登录。
+
+Pinia auth store 要点：
+- state：accessToken、refreshToken、user。
+- getters：isLoggedIn、isAdmin。
+- actions：setTokens、login、refresh、fetchMe、clear。
+- token 持久化到 localStorage。
+
+十、文件存储
+
+目录结构：
+data/uploads/{task_id}_original.jpg
+data/results/{task_id}_annotated.jpg
+
+访问方式：
+- FastAPI 挂载 app.mount("/files", StaticFiles(directory="data"))
+- 返回 URL 形如 /files/results/xxx_annotated.jpg
+- 生产环境建议 Nginx 直接服务 /files/
+
+清理：
+- 删除任务时同步删除对应文件。
+- 提供 scripts/clean_orphan_files.py 清理无记录文件。
+
+十一、配置项（.env）
+
+APP_NAME=PhotoCount
+APP_ENV=dev
+APP_HOST=0.0.0.0
+APP_PORT=8000
+
+DATABASE_URL=sqlite:///./data/app.db
+生产示例：postgresql+psycopg2://user:pass@db:5432/photocount
+
+JWT_SECRET=please-change-me
+JWT_ALGORITHM=HS256
+ACCESS_TOKEN_EXPIRE_MINUTES=120
+REFRESH_TOKEN_EXPIRE_DAYS=14
+
+STORAGE_DIR=./data
+MAX_UPLOAD_MB=10
+
+DEFAULT_MAX_SIDE=1600
+DEFAULT_MIN_AREA=100
+DEFAULT_FG_RATIO=0.5
+
+config.py 使用 pydantic-settings 读取。
+
+十二、部署
+
+docker-compose 服务：
+- db：postgres:15，卷 pgdata
+- backend：构建 ./backend，env_file 指向 .env，卷挂载 ./data，暴露 8000
+- frontend：构建 ./frontend，暴露 80
+
+Nginx 关键配置：
+- listen 80
+- client_max_body_size 10m
+- location /api/ 代理到 backend:8000，proxy_read_timeout 30s
+- location /files/ alias 到 /app/data/
+- location / 指向前端静态目录，try_files $uri $uri/ /index.html
+
+后端启动：
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4
+
+十三、安全要求
+
+- 密码必须 bcrypt 哈希，禁止明文存储。
+- JWT 密钥不得硬编码，必须从环境变量读取。
+- 上传文件校验：扩展名白名单 jpg、jpeg、png、webp、bmp；校验 MIME；大小不超过 MAX_UPLOAD_MB；用 Pillow 打开验证是真实图片。
+- 文件名一律用 task_id 生成，禁止使用用户原始文件名。
+- 路径穿越防护：所有文件路径基于 STORAGE_DIR 拼接后校验前缀。
+- CORS 仅允许配置的前端域名。
+- 登录失败限流：同一 IP 或用户名 5 分钟内失败 10 次锁定。
+- 所有管理接口必须 require_admin。
+- 生产环境强制 HTTPS。
+
+十四、测试要求
+
+后端单元测试：
+- test_counting.py：固定样例图验证计数与实例数
+- test_security.py：密码哈希、JWT 签发与校验
+- test_image_io.py：EXIF 方向、缩放
+
+后端接口测试：
+- test_auth.py：登录、刷新、登出、401
+- test_count_api.py：上传、查询、编辑、CSV、配额
+- test_admin.py：权限隔离、用户 CRUD
+
+覆盖率目标：核心模块 70% 以上。
+
+前端测试：
+- 组件测试 Vitest：ImageUploader、ResultViewer
+- 路由守卫测试：未登录跳转、非 admin 拦截
+
+手工验收：
+- 手机 Chrome 或 Safari 打开页面，拍照上传，1～3 秒内返回结果
+- 重复上传同一张图，结果一致
+- 超额时提示配额已满
+- admin 能创建用户、重置密码、查看所有任务
+
+十五、开发里程碑
+
+M1  后端骨架 + 分水岭计数 + 文件存储，/api/count 可用
+M2  登录 / JWT / 权限，/api/auth/* 与 /api/users/* 可用
+M3  管理员创建用户、任务记录、历史、CSV
+M4  前端骨架 + 登录 + 计数页，浏览器跑通完整流程
+M5  统计模块 + 前端图表
+M6  管理后台 + 用户管理 + 全局统计
+M7  Docker 化 + Nginx + 文档
+
+十六、验收标准
+
+1. 系统不提供注册入口，账号只能由管理员创建。
+2. 用户可登录、登出，token 过期自动刷新。
+3. 登录用户上传图片，服务端返回计数与标注图，前端展示。
+4. 计数结果写入 tasks 表，历史页可查、可删、可导出 CSV。
+5. 个人统计页展示总览、按天趋势、按模式分布。
+6. admin 可管理用户、重置密码、查看全局统计。
+7. 配额生效，超限返回 429。
+8. 所有接口有统一响应格式和错误处理。
+9. 单张 2MP 图处理耗时小于 1 秒（4 核 CPU）。
+10. 项目可通过 docker-compose 一键启动。
+11. README 包含部署、配置、开发说明。
+
+十七、后续扩展（不在本期）
+
+- 接入 YOLOv8-seg，按 mode 分发，counting.py 增加分支即可
+- 接入 Cellpose 处理细胞
+- 人工修正点的交互式编辑器
+- Redis 缓存 + 任务队列，支持高并发
+- 对象存储 OSS 或 S3 + CDN
+- 批量上传与批量计数
+- 审计日志
+- 多语言
+
+十八、交付要求
+
+- 代码提交到 Git 仓库，含 .gitignore、README.md、.env.example
+- 后端提供 OpenAPI 文档，FastAPI 自带 /docs
+- 提供 docker-compose.yml，docker-compose up -d 可启动
+- 提供 scripts/seed.py：创建默认 admin 账号，用户名 admin，密码 admin123，首次登录强制改密
+- 提供 samples/ 示例图片用于测试
+
+十九、接口速查
+
+POST   /api/auth/login
+POST   /api/auth/refresh
+POST   /api/auth/logout
+GET    /api/auth/me
+POST   /api/auth/change-password
+
+POST   /api/count
+GET    /api/count/{task_id}
+POST   /api/count/{task_id}/edit
+GET    /api/count/{task_id}/csv
+
+GET    /api/tasks
+DELETE /api/tasks/{task_id}
+
+GET    /api/stats/me/summary
+GET    /api/stats/me/daily?days=30
+GET    /api/stats/me/by-mode
+
+GET    /api/admin/users
+POST   /api/admin/users
+PATCH  /api/admin/users/{id}
+DELETE /api/admin/users/{id}
+POST   /api/admin/users/{id}/reset-password
+GET    /api/admin/overview
+GET    /api/admin/tasks
+
+文档结束。开发过程中如遇歧义，优先保证功能可用、结构清晰、易于替换算法，并在 README 中记录所有偏离本文档的决策。

@@ -1,0 +1,13 @@
+services:
+  backend:
+    build: { context: ./backend, dockerfile: Dockerfile }
+    volumes: ["./data:/app/data"]
+    env_file: [.env]
+    environment: ["TZ=Asia/Shanghai"]
+    restart: unless-stopped
+  frontend:
+    build: ./frontend
+    ports: ["20010:80"]
+    depends_on: [backend]
+    environment: ["TZ=Asia/Shanghai"]
+    restart: unless-stopped

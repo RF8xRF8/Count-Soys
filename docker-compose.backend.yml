@@ -1,0 +1,10 @@
+# 仅启动后端（前端静态资源另行部署或本机 pnpm dev）
+# 用法：docker compose -f docker-compose.backend.yml up -d --build
+services:
+  backend:
+    build: { context: ., dockerfile: Dockerfile }
+    ports: ["2089:8000"]
+    volumes: ["./data:/app/data"]
+    env_file: [.env]
+    environment: ["TZ=Asia/Shanghai"]
+    restart: unless-stopped

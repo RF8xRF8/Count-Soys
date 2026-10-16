@@ -1,0 +1,1 @@
+Frontend and backend source files are organized under frontend/ and backend/.

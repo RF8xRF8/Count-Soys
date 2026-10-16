@@ -1,0 +1,9 @@
+{
+  "name": "photo-count-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": { "dev": "vite", "build": "vite build" },
+  "dependencies": { "@vitejs/plugin-vue": "latest", "axios": "latest", "echarts": "latest", "element-plus": "latest", "pinia": "latest", "vue": "latest", "vue-router": "latest" },
+  "devDependencies": { "vite": "latest" }
+}
